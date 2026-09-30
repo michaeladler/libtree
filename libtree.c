@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <ctype.h>
+#include <errno.h>
 #include <glob.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -498,7 +499,7 @@ static int check_search_paths(struct found_t reason, size_t offset,
     struct string_table_t const *st = &s->string_table;
 
     while (st->arr[offset] != '\0') {
-        // First remove trailing colons
+        // First skip leading colons
         while (st->arr[offset] == ':' && st->arr[offset] != '\0')
             ++offset;
 
@@ -756,9 +757,10 @@ static void print_error(size_t depth, size_t needed_not_found,
         if (s->color)
             fputs(BOLD_RED, stdout);
         fputs(s->string_table.arr + needed_buf_offsets->p[i], stdout);
-        fputs(" not found\n", stdout);
+        fputs(" not found", stdout);
         if (s->color)
             fputs(CLEAR, stdout);
+        putchar('\n');
     }
 
     // If anything was not found, we print the search paths in order they
@@ -768,6 +770,8 @@ static void print_error(size_t depth, size_t needed_not_found,
                  : JUST_INDENT LIGHT_QUADRUPLE_DASH_VERTICAL;
     char *indent = malloc(sizeof(LIGHT_VERTICAL_WITH_INDENT) * depth +
                           strlen(box_vertical) + 1);
+    if (indent == NULL)
+        exit(1);
     char *p = indent;
     for (size_t i = 0; i < depth; ++i) {
         if (s->found_all_needed[i]) {
@@ -1581,10 +1585,14 @@ static void libtree_state_init(struct libtree_state_t *s) {
     s->string_table.n = 0;
     s->string_table.capacity = 1024;
     s->string_table.arr = malloc(s->string_table.capacity * sizeof(char));
+    if (s->string_table.arr == NULL)
+        exit(1);
     s->visited.n = 0;
     s->visited.capacity = 256;
     s->visited.arr =
         malloc(s->visited.capacity * sizeof(struct visited_file_t));
+    if (s->visited.arr == NULL)
+        exit(1);
 }
 
 static void libtree_state_free(struct libtree_state_t *s) {
@@ -1774,9 +1782,16 @@ int main(int argc, char **argv) {
                     fputs("Expected value after `--max-depth`\n", stderr);
                     return 1;
                 }
-                // Limit it by MAX_RECURSION_DEPTH.
+                char *value = argv[++i];
                 char *ptr;
-                s.max_depth = strtoul(argv[++i], &ptr, 10);
+                errno = 0;
+                s.max_depth = strtoul(value, &ptr, 10);
+                if (!isdigit((unsigned char)*value) || *ptr != '\0' ||
+                    errno == ERANGE) {
+                    fputs("Invalid value for `--max-depth`\n", stderr);
+                    return 1;
+                }
+                // Limit it by MAX_RECURSION_DEPTH.
                 if (s.max_depth > MAX_RECURSION_DEPTH)
                     s.max_depth = MAX_RECURSION_DEPTH;
             } else {
