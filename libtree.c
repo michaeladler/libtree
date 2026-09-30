@@ -51,6 +51,7 @@
 #define ERR_VADDRS_NOT_ORDERED 30
 #define ERR_COULD_NOT_OPEN_FILE 31
 #define ERR_INCOMPATIBLE_ISA 32
+#define ERR_INVALID_STRTAB 33
 
 #define DT_FLAGS_1 0x6ffffffb
 #define DT_1_NODEFLIB 0x800
@@ -1002,9 +1003,11 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
     // the file which means that we have to translate vaddr to file offset)
     struct small_vec_u64_t pt_load_offset;
     struct small_vec_u64_t pt_load_vaddr;
+    struct small_vec_u64_t pt_load_filesz;
 
     small_vec_u64_init(&pt_load_offset);
     small_vec_u64_init(&pt_load_vaddr);
+    small_vec_u64_init(&pt_load_filesz);
 
     // Read the program header.
     uint64_t p_offset = MAX_OFFSET_T;
@@ -1014,12 +1017,14 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
                 fclose(fptr);
                 small_vec_u64_free(&pt_load_offset);
                 small_vec_u64_free(&pt_load_vaddr);
+                small_vec_u64_free(&pt_load_filesz);
                 return ERR_INVALID_PROG_HEADER;
             }
 
             if (prog.p64.p_type == PT_LOAD) {
                 small_vec_u64_append(&pt_load_offset, prog.p64.p_offset);
                 small_vec_u64_append(&pt_load_vaddr, prog.p64.p_vaddr);
+                small_vec_u64_append(&pt_load_filesz, prog.p64.p_filesz);
             } else if (prog.p64.p_type == PT_DYNAMIC) {
                 p_offset = prog.p64.p_offset;
             }
@@ -1030,12 +1035,14 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
                 fclose(fptr);
                 small_vec_u64_free(&pt_load_offset);
                 small_vec_u64_free(&pt_load_vaddr);
+                small_vec_u64_free(&pt_load_filesz);
                 return ERR_INVALID_PROG_HEADER;
             }
 
             if (prog.p32.p_type == PT_LOAD) {
                 small_vec_u64_append(&pt_load_offset, prog.p32.p_offset);
                 small_vec_u64_append(&pt_load_vaddr, prog.p32.p_vaddr);
+                small_vec_u64_append(&pt_load_filesz, prog.p32.p_filesz);
             } else if (prog.p32.p_type == PT_DYNAMIC) {
                 p_offset = prog.p32.p_offset;
             }
@@ -1048,6 +1055,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         fclose(fptr);
         small_vec_u64_free(&pt_load_offset);
         small_vec_u64_free(&pt_load_vaddr);
+        small_vec_u64_free(&pt_load_filesz);
         return ERR_CANT_STAT;
     }
 
@@ -1062,6 +1070,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         fclose(fptr);
         small_vec_u64_free(&pt_load_offset);
         small_vec_u64_free(&pt_load_vaddr);
+        small_vec_u64_free(&pt_load_filesz);
         return 0;
     }
 
@@ -1072,6 +1081,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         fclose(fptr);
         small_vec_u64_free(&pt_load_offset);
         small_vec_u64_free(&pt_load_vaddr);
+        small_vec_u64_free(&pt_load_filesz);
         return ERR_NO_PT_LOAD;
     }
 
@@ -1080,6 +1090,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         fclose(fptr);
         small_vec_u64_free(&pt_load_offset);
         small_vec_u64_free(&pt_load_vaddr);
+        small_vec_u64_free(&pt_load_filesz);
         return ERR_INVALID_DYNAMIC_SECTION;
     }
 
@@ -1107,6 +1118,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
                 fclose(fptr);
                 small_vec_u64_free(&pt_load_offset);
                 small_vec_u64_free(&pt_load_vaddr);
+                small_vec_u64_free(&pt_load_filesz);
                 small_vec_u64_free(&needed);
                 return ERR_INVALID_DYNAMIC_ARRAY_ENTRY;
             }
@@ -1119,6 +1131,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
                 fclose(fptr);
                 small_vec_u64_free(&pt_load_offset);
                 small_vec_u64_free(&pt_load_vaddr);
+                small_vec_u64_free(&pt_load_filesz);
                 small_vec_u64_free(&needed);
                 return ERR_INVALID_DYNAMIC_ARRAY_ENTRY;
             }
@@ -1156,6 +1169,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         fclose(fptr);
         small_vec_u64_free(&pt_load_offset);
         small_vec_u64_free(&pt_load_vaddr);
+        small_vec_u64_free(&pt_load_filesz);
         small_vec_u64_free(&needed);
         return ERR_NO_STRTAB;
     }
@@ -1165,6 +1179,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
     if (!is_ascending_order(pt_load_vaddr.p, pt_load_vaddr.n)) {
         fclose(fptr);
         small_vec_u64_free(&pt_load_vaddr);
+        small_vec_u64_free(&pt_load_filesz);
         small_vec_u64_free(&pt_load_offset);
         small_vec_u64_free(&needed);
         return ERR_VADDRS_NOT_ORDERED;
@@ -1177,10 +1192,23 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         ++vaddr_idx;
     }
 
+    if (strtab < pt_load_vaddr.p[vaddr_idx] ||
+        strtab - pt_load_vaddr.p[vaddr_idx] >= pt_load_filesz.p[vaddr_idx] ||
+        strtab - pt_load_vaddr.p[vaddr_idx] >
+            UINT64_MAX - pt_load_offset.p[vaddr_idx]) {
+        fclose(fptr);
+        small_vec_u64_free(&pt_load_vaddr);
+        small_vec_u64_free(&pt_load_filesz);
+        small_vec_u64_free(&pt_load_offset);
+        small_vec_u64_free(&needed);
+        return ERR_INVALID_STRTAB;
+    }
+
     uint64_t strtab_offset =
-        pt_load_offset.p[vaddr_idx] + strtab - pt_load_vaddr.p[vaddr_idx];
+        pt_load_offset.p[vaddr_idx] + (strtab - pt_load_vaddr.p[vaddr_idx]);
 
     small_vec_u64_free(&pt_load_vaddr);
+    small_vec_u64_free(&pt_load_filesz);
     small_vec_u64_free(&pt_load_offset);
 
     // From this point on we actually copy strings from the ELF file into our
@@ -1616,6 +1644,9 @@ static int print_tree(int pathc, char **pathv, struct libtree_state_t *s) {
             break;
         case ERR_NO_STRTAB:
             msg = "No ELF string table found\n";
+            break;
+        case ERR_INVALID_STRTAB:
+            msg = "Invalid ELF string table address\n";
             break;
         case ERR_INVALID_SONAME:
             msg = "Can't read DT_SONAME\n";
