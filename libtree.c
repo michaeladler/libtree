@@ -435,8 +435,10 @@ static int check_absolute_paths(size_t *needed_not_found,
         size_t len = strlen(st->arr + needed_buf_offsets->p[i]);
 
         // Unlikely to happen but good to guard against
-        if (len >= MAX_PATH_LENGTH)
+        if (len >= MAX_PATH_LENGTH) {
+            ++i;
             continue;
+        }
 
         // Include \0
         memcpy(path, st->arr + needed_buf_offsets->p[i], len + 1);
@@ -523,8 +525,10 @@ static int check_search_paths(struct found_t reason, size_t offset,
             size_t soname_len = strlen(st->arr + needed_buf_offsets->p[i]);
 
             // Path too long, can't handle.
-            if (search_path_end + soname_len + 1 >= path_end)
+            if (search_path_end + soname_len + 1 >= path_end) {
+                ++i;
                 continue;
+            }
 
             // Otherwise append.
             memcpy(search_path_end, st->arr + needed_buf_offsets->p[i],
