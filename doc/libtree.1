@@ -55,6 +55,24 @@ Path to custom
 or
 .I ld-elf.so.conf
 file
+.IP "--sysroot dir, --rootfs dir"
+Treat
+.I dir
+as the root of the target file system, e.g. a cross-architecture rootfs.
+Absolute paths and include patterns in ld.so.conf are resolved inside
+.IR dir .
+The default search paths, absolute
+.B DT_RPATH
+/
+.B DT_RUNPATH
+entries, absolute
+.B DT_NEEDED
+entries and the ldd interpreter lookup are resolved inside
+.IR dir .
+Paths derived from $ORIGIN and
+.B LD_LIBRARY_PATH
+are used as given. Unless --ldconf is passed, the config file is read from
+.IR dir /etc/ld.so.conf.
 .IP "--max-depth n"
 Limit library traversal to a depth of at most
 .IR n .

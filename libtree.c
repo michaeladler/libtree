@@ -218,6 +218,13 @@ struct libtree_state_t {
     char *ld_conf_file;
     unsigned long max_depth;
 
+    // Optional root directory of the target file system (e.g. a cross-arch
+    // rootfs). Absolute search paths, absolute DT_NEEDED
+    // entries and the ld.so.conf location are resolved relative to it.
+    // Empty string when not set; never has a trailing slash.
+    char const *sysroot;
+    size_t sysroot_len;
+
     struct string_table_t string_table;
     struct visited_file_array_t visited;
     struct string_table_t unresolved;
@@ -361,6 +368,32 @@ static void string_table_copy_from_file(struct string_table_t *t, FILE *fptr) {
     t->arr[t->n++] = '\0';
 }
 
+// Copy the colon-delimited path list starting at `src` to the end of the
+// string table, prefixing every absolute entry with `sysroot`. Returns the
+// offset of the copy, or `src` itself if there is no sysroot.
+static size_t prefix_path_list(struct string_table_t *t, size_t src,
+                               char const *sysroot, size_t sysroot_len) {
+    if (sysroot_len == 0)
+        return src;
+    size_t dst = t->n;
+    int at_entry_start = 1;
+    for (;;) {
+        // note: t->arr may move on growth, so always index via offsets.
+        char c = t->arr[src++];
+        if (at_entry_start && c == '/') {
+            string_table_maybe_grow(t, sysroot_len);
+            memcpy(t->arr + t->n, sysroot, sysroot_len);
+            t->n += sysroot_len;
+        }
+        string_table_maybe_grow(t, 1);
+        t->arr[t->n++] = c;
+        if (c == '\0')
+            break;
+        at_entry_start = c == ':';
+    }
+    return dst;
+}
+
 static int is_in_exclude_list(char *soname) {
     // Get to the end.
     char *start = soname;
@@ -451,18 +484,21 @@ static int check_absolute_paths(size_t *needed_not_found,
             continue;
         }
 
-        // Copy the path over.
+        // Copy the path over, prefixed with the sysroot if absolute.
         char path[MAX_PATH_LENGTH];
-        size_t len = strlen(st->arr + needed_buf_offsets->p[i]);
+        char const *needed_name = st->arr + needed_buf_offsets->p[i];
+        size_t len = strlen(needed_name);
+        size_t prefix_len = needed_name[0] == '/' ? s->sysroot_len : 0;
 
         // Unlikely to happen but good to guard against
-        if (len >= MAX_PATH_LENGTH) {
+        if (prefix_len + len >= MAX_PATH_LENGTH) {
             ++i;
             continue;
         }
 
         // Include \0
-        memcpy(path, st->arr + needed_buf_offsets->p[i], len + 1);
+        memcpy(path, s->sysroot, prefix_len);
+        memcpy(path + prefix_len, needed_name, len + 1);
 
         s->found_all_needed[depth] = *needed_not_found <= 1;
         char *err = NULL;
@@ -959,7 +995,16 @@ static void print_ldd_metadata(char *interpreter, size_t needed,
     }
     printf("\t%s\n", interpreter);
     struct stat identity;
-    if (stat(interpreter, &identity) == 0) {
+    char host_path[MAX_PATH_LENGTH];
+    char const *lookup = interpreter;
+    if (interpreter[0] == '/' && s->sysroot_len != 0) {
+        if (s->sysroot_len + strlen(interpreter) >= sizeof(host_path))
+            return;
+        memcpy(host_path, s->sysroot, s->sysroot_len);
+        strcpy(host_path + s->sysroot_len, interpreter);
+        lookup = host_path;
+    }
+    if (stat(lookup, &identity) == 0) {
         s->interpreter.st_dev = identity.st_dev;
         s->interpreter.st_ino = identity.st_ino;
         s->has_interpreter_identity = 1;
@@ -1424,6 +1469,11 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
 
         string_table_copy_from_file(&s->string_table, fptr);
 
+        // Absolute entries live inside the sysroot; $ORIGIN ones already do.
+        s->rpath_offsets[depth] =
+            prefix_path_list(&s->string_table, s->rpath_offsets[depth],
+                             s->sysroot, s->sysroot_len);
+
         // We store the interpolated string right after the literal copy.
         size_t curr_buf_size = s->string_table.n;
         if (interpolate_variables(s, s->rpath_offsets[depth], origin))
@@ -1441,6 +1491,10 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         }
 
         string_table_copy_from_file(&s->string_table, fptr);
+
+        runpath_buf_offset =
+            prefix_path_list(&s->string_table, runpath_buf_offset, s->sysroot,
+                             s->sysroot_len);
 
         // We store the interpolated string right after the literal copy.
         size_t curr_buf_size = s->string_table.n;
@@ -1563,10 +1617,10 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
 }
 
 static int parse_ld_config_file(struct string_table_t *st, char *path,
-                                size_t depth);
+                                size_t depth, char const *sysroot);
 
 static int ld_conf_globbing(struct string_table_t *st, char *pattern,
-                            size_t depth) {
+                            size_t depth, char const *sysroot) {
     glob_t result;
     memset(&result, 0, sizeof(result));
     int status = glob(pattern, 0, NULL, &result);
@@ -1585,14 +1639,16 @@ static int ld_conf_globbing(struct string_table_t *st, char *pattern,
     // Otherwise parse the files we've found!
     int code = 0;
     for (size_t i = 0; i < result.gl_pathc; ++i)
-        code |= parse_ld_config_file(st, result.gl_pathv[i], depth);
+        code |= parse_ld_config_file(st, result.gl_pathv[i], depth, sysroot);
 
     globfree(&result);
     return code;
 }
 
+// Paths stored in the string table and absolute include patterns are
+// prefixed with `sysroot` (use "" for none).
 static int parse_ld_config_file(struct string_table_t *st, char *path,
-                                size_t depth) {
+                                size_t depth, char const *sysroot) {
     // 32-file nesting cap; use file identities for deeper trees.
     if (depth >= MAX_RECURSION_DEPTH)
         return 1;
@@ -1649,7 +1705,16 @@ static int parse_ld_config_file(struct string_table_t *st, char *path,
 
             // Prepend config dir when include dir is relative.
             char *wd = strrchr(path, '/');
-            if (*begin != '/' && wd != NULL) {
+            if (*begin == '/' && *sysroot != '\0') {
+                size_t sysroot_len = strlen(sysroot);
+                size_t include_len = end - begin + 1;
+                if (sysroot_len + include_len >= MAX_PATH_LENGTH)
+                    continue;
+                memcpy(tmp, sysroot, sysroot_len);
+                memcpy(tmp + sysroot_len, begin, include_len);
+                tmp[sysroot_len + include_len] = '\0';
+                begin = tmp;
+            } else if (*begin != '/' && wd != NULL) {
                 // bytes until /
                 size_t wd_len = wd - path;
                 size_t include_len = end - begin + 1;
@@ -1665,9 +1730,13 @@ static int parse_ld_config_file(struct string_table_t *st, char *path,
                 begin = tmp;
             }
 
-            ld_conf_globbing(st, begin, depth + 1);
+            ld_conf_globbing(st, begin, depth + 1, sysroot);
         } else {
             // Copy over and replace trailing \0 with :.
+            if (*begin == '/' && *sysroot != '\0') {
+                string_table_store(st, sysroot);
+                --st->n; // drop the \0, keep appending
+            }
             string_table_store(st, begin);
             st->arr[st->n - 1] = ':';
         }
@@ -1683,7 +1752,7 @@ static void parse_ld_so_conf(struct libtree_state_t *s) {
     s->ld_so_conf_offset = st->n;
 
     // Linux / glibc
-    parse_ld_config_file(st, s->ld_conf_file, 0);
+    parse_ld_config_file(st, s->ld_conf_file, 0, s->sysroot);
 
     // Replace the last semicolon with a '\0'
     // if we have a nonzero number of paths.
@@ -1717,6 +1786,9 @@ static void set_default_paths(struct libtree_state_t *s) {
     s->default_paths_offset = s->string_table.n;
     // TODO: how to retrieve this list properly at runtime?
     string_table_store(&s->string_table, "/lib:/lib64:/usr/lib:/usr/lib64");
+    s->default_paths_offset =
+        prefix_path_list(&s->string_table, s->default_paths_offset,
+                         s->sysroot, s->sysroot_len);
 }
 
 static void libtree_state_init(struct libtree_state_t *s) {
@@ -1874,6 +1946,9 @@ int main(int argc, char **argv) {
     s.OSNAME = uname_val.sysname;
     s.OSREL = uname_val.release;
     s.ld_conf_file = "/etc/ld.so.conf";
+    s.sysroot = "";
+    s.sysroot_len = 0;
+    int opt_ldconf = 0;
 
     if (strcmp(uname_val.sysname, "FreeBSD") == 0)
         s.ld_conf_file = "/etc/ld-elf.so.conf";
@@ -1945,6 +2020,14 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 s.ld_conf_file = argv[++i];
+                opt_ldconf = 1;
+            } else if (strcmp(arg, "sysroot") == 0 ||
+                       strcmp(arg, "rootfs") == 0) {
+                if (i + 1 == argc || argv[i + 1][0] == '\0') {
+                    fprintf(stderr, "Expected value after `--%s`\n", arg);
+                    return 1;
+                }
+                s.sysroot = argv[++i];
             } else if (strcmp(arg, "max-depth") == 0) {
                 // Require a value
                 if (i + 1 == argc) {
@@ -1997,6 +2080,50 @@ int main(int argc, char **argv) {
     ++argv;
     --positional;
 
+    // Normalize the sysroot: strip trailing slashes ("/" becomes "").
+    size_t sysroot_len = strlen(s.sysroot);
+    while (sysroot_len > 0 && s.sysroot[sysroot_len - 1] == '/')
+        --sysroot_len;
+    char *sysroot_buf = NULL;
+    char *ld_conf_buf = NULL;
+    if (sysroot_len > 0) {
+        // Make a relative sysroot absolute, so that sysroot-prefixed paths
+        // stay absolute (e.g. for absolute DT_NEEDED entries).
+        char cwd[MAX_PATH_LENGTH];
+        size_t cwd_len = 0;
+        if (s.sysroot[0] != '/') {
+            if (getcwd(cwd, sizeof(cwd)) == NULL) {
+                fputs("Could not determine the current working directory\n",
+                      stderr);
+                return 1;
+            }
+            cwd_len = strlen(cwd);
+            if (cwd[cwd_len - 1] != '/')
+                cwd[cwd_len++] = '/';
+        }
+        sysroot_buf = malloc(cwd_len + sysroot_len + 1);
+        if (sysroot_buf == NULL)
+            return 1;
+        memcpy(sysroot_buf, cwd, cwd_len);
+        memcpy(sysroot_buf + cwd_len, s.sysroot, sysroot_len);
+        sysroot_len += cwd_len;
+        sysroot_buf[sysroot_len] = '\0';
+        s.sysroot = sysroot_buf;
+        // Unless given explicitly, read the target's ld.so.conf.
+        if (!opt_ldconf) {
+            size_t conf_len = strlen(s.ld_conf_file);
+            ld_conf_buf = malloc(sysroot_len + conf_len + 1);
+            if (ld_conf_buf == NULL)
+                return 1;
+            memcpy(ld_conf_buf, sysroot_buf, sysroot_len);
+            memcpy(ld_conf_buf + sysroot_len, s.ld_conf_file, conf_len + 1);
+            s.ld_conf_file = ld_conf_buf;
+        }
+    } else {
+        s.sysroot = "";
+    }
+    s.sysroot_len = sysroot_len;
+
     // Print a help message on -h, --help or no positional args.
     if (opt_help || (!opt_version && positional == 0)) {
         // clang-format off
@@ -2019,6 +2146,9 @@ int main(int argc, char **argv) {
               "  --ldconf <path>  Config file for extra search paths [", stdout);
         fputs(s.ld_conf_file, stdout);
         fputs("]\n"
+              "  --sysroot <dir>  Resolve absolute library paths inside <dir>, e.g. a\n"
+              "                   cross-arch rootfs; also --rootfs. Default ldconf\n"
+              "                   becomes <dir>/etc/ld.so.conf\n"
               "  --max-depth <n>  Limit library traversal to at most n levels of depth\n"
               "                   Truncates dependencies; ldd still shows the interpreter\n"
               "\n"
@@ -2065,5 +2195,8 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    return print_tree(positional, argv, &s);
+    int exit_code = print_tree(positional, argv, &s);
+    free(sysroot_buf);
+    free(ld_conf_buf);
+    return exit_code;
 }

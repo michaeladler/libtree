@@ -7,7 +7,7 @@
 int main(int argc, char **argv) {
     assert(argc == 2 || argc == 3);
     struct string_table_t st = {0};
-    assert(parse_ld_config_file(&st, argv[1], 0) == 0);
+    assert(parse_ld_config_file(&st, argv[1], 0, "") == 0);
     const char *expected = argc == 2 ? "/usr/lib:/:x:/opt/lib:/:/opt/lib:/:"
                                      : "/cycle:";
     size_t len = strlen(expected);
