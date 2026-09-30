@@ -1467,11 +1467,9 @@ static int parse_ld_config_file(struct string_table_t *st, char *path) {
             while (isspace(*begin))
                 ++begin;
 
-            // Prepend current dir when include dir is relative.
-            if (*begin != '/') {
-                char *wd = strrchr(path, '/');
-                wd = wd == NULL ? strrchr(path, '\0') : wd;
-
+            // Prepend config dir when include dir is relative.
+            char *wd = strrchr(path, '/');
+            if (*begin != '/' && wd != NULL) {
                 // bytes until /
                 size_t wd_len = wd - path;
                 size_t include_len = end - begin + 1;
