@@ -199,6 +199,7 @@ struct string_table_t {
 struct visited_file_t {
     dev_t st_dev;
     ino_t st_ino;
+    size_t depth; // shallowest depth at which this file was visited
 };
 
 struct visited_file_array_t {
@@ -878,18 +879,25 @@ static void print_error(size_t depth, size_t needed_not_found,
     free(indent);
 }
 
-static int visited_files_contains(struct visited_file_array_t *files,
-                                  struct stat *needle) {
+static struct visited_file_t *
+visited_files_find(struct visited_file_array_t *files, struct stat *needle) {
     for (size_t i = 0; i < files->n; ++i) {
         struct visited_file_t *f = &files->arr[i];
         if (f->st_dev == needle->st_dev && f->st_ino == needle->st_ino)
-            return 1;
+            return f;
     }
-    return 0;
+    return NULL;
 }
 
+// Record a visit; if already present, keep the shallowest depth.
 static void visited_files_append(struct visited_file_array_t *files,
-                                 struct stat *new) {
+                                 struct stat *new, size_t depth) {
+    struct visited_file_t *existing = visited_files_find(files, new);
+    if (existing != NULL) {
+        if (depth < existing->depth)
+            existing->depth = depth;
+        return;
+    }
     if (files->n == files->capacity) {
         files->capacity *= 2;
         files->arr = realloc(files->arr,
@@ -899,6 +907,7 @@ static void visited_files_append(struct visited_file_array_t *files,
     }
     files->arr[files->n].st_dev = new->st_dev;
     files->arr[files->n].st_ino = new->st_ino;
+    files->arr[files->n].depth = depth;
     ++files->n;
 }
 
@@ -1064,10 +1073,13 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         return ERR_CANT_STAT;
     }
 
-    int seen_before = visited_files_contains(&s->visited, &finfo);
+    struct visited_file_t *prev_visit = visited_files_find(&s->visited, &finfo);
+    int seen_before = prev_visit != NULL;
+    // A file previously reached only at a deeper level must be traversed
+    // again, otherwise --max-depth may cut off its dependencies.
+    int revisit_shallower = seen_before && depth < prev_visit->depth;
 
-    if (!seen_before)
-        visited_files_append(&s->visited, &finfo);
+    visited_files_append(&s->visited, &finfo, depth);
 
     // No dynamic section?
     if (p_offset == MAX_OFFSET_T) {
@@ -1239,6 +1251,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
     int should_recurse =
         depth < s->max_depth &&
         ((!seen_before && !in_exclude_list) ||
+         (revisit_shallower && !in_exclude_list) ||
          (!seen_before && in_exclude_list && s->verbosity >= 2) ||
          s->verbosity >= 3);
 
