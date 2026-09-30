@@ -511,8 +511,10 @@ static int check_search_paths(struct found_t reason, size_t offset,
             *dest++ = st->arr[offset++];
 
         // Path too long... Can't handle.
-        if (dest + 1 >= path_end)
+        if (dest >= path_end - 1) {
+            offset += strcspn(st->arr + offset, ":");
             continue;
+        }
 
         // Add a separator if necessary
         if (*(dest - 1) != '/')
