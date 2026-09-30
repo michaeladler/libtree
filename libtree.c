@@ -1437,7 +1437,6 @@ static int parse_ld_config_file(struct string_table_t *st, char *path) {
         line[line_len] = '\0';
 
         char *begin = line;
-        char *end = line + line_len;
         // Remove leading whitespace
         for (; isspace(*begin); ++begin) {
         }
@@ -1447,14 +1446,16 @@ static int parse_ld_config_file(struct string_table_t *st, char *path) {
         if (comment != NULL)
             *comment = '\0';
 
-        // Remove trailing whitespace
-        while (end != begin)
-            if (!isspace(*--end))
-                break;
+        char *end = begin + strlen(begin);
 
         // Skip empty lines
         if (begin == end)
             continue;
+
+        // Remove trailing whitespace
+        while (end != begin)
+            if (!isspace(*--end))
+                break;
 
         // Put back the end of the string
         end[1] = '\0';
