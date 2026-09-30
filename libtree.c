@@ -462,6 +462,7 @@ static int check_absolute_paths(size_t *needed_not_found,
             // of transient deps.
             if (code != 0 && code != ERR_DEPENDENCY_NOT_FOUND) {
                 err = " not found";
+                exit_code = ERR_DEPENDENCY_NOT_FOUND;
             }
         }
 
@@ -470,7 +471,7 @@ static int check_absolute_paths(size_t *needed_not_found,
             if (s->color)
                 fputs(BOLD_RED, stdout);
             fputs(path, stdout);
-            fputs(" is not absolute", stdout);
+            fputs(err, stdout);
             fputs(s->color ? CLEAR "\n" : "\n", stdout);
         }
 
