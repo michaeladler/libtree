@@ -70,7 +70,7 @@ static void check(int bits, uint64_t first_vaddr, uint64_t second_vaddr,
     struct libtree_state_t state = {0};
     libtree_state_init(&state);
     assert(recurse("exe_elf", 0, &state, (struct compat_t){.any = 1},
-                   (struct found_t){.how = INPUT}) == expected);
+                   (struct found_t){.how = INPUT}, SIZE_MAX) == expected);
     libtree_state_free(&state);
     assert(remove("exe_elf") == 0);
 }

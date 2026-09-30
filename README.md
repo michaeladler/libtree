@@ -21,6 +21,25 @@ Use the `--path` or `-p` flags to show paths rather than sonames:
 
 Use `--max-depth` to limit the recursion depth.
 
+### Formats
+
+It is possible to select a different output format. For example, to get ldd-compatible
+output:
+
+```sh
+libtree --format ldd /usr/bin/tar
+```
+
+Unlike `ldd`, this inspects ELF files without executing the target or invoking its
+loader. It includes common libraries and their transitive dependencies, e.g.:
+
+```text
+	libexample.so.1 => /opt/lib/libexample.so.1
+	libmissing.so.1 => not found
+	/lib64/ld-linux-x86-64.so.2
+```
+
+**Note**: In `ldd` mode, `--path` is redundant and verbosity flags have no effect.
 
 ## Install
 

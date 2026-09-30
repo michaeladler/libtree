@@ -3,7 +3,7 @@
 .\"
 .TH libtree 1 "2020-04-13" Linux "User Manuals"
 .SH NAME
-libtree \- print shared object dependencies as a tree
+libtree \- inspect shared object dependencies as a tree or ldd-style mappings
 .SH SYNOPSIS
 .B libtree 
 [
@@ -14,16 +14,37 @@ libtree \- print shared object dependencies as a tree
 .SH DESCRIPTION
 .B libtree
 prints the shared libraries required by each program or shared library on the command line as a tree. By default certain common system libraries are hidden to prune the tree.
+ELF files are inspected without executing the target or invoking its loader.
+The ldd format includes common libraries and their transitive dependencies.
 .SH OPTIONS
 .IP "-h, --help"
 Print usage
 .IP "--version"
 Print version info
+.IP "--format tree|ldd, --format=tree|ldd"
+Select the output format. The default is tree.
+The ldd format prints tab-indented mappings using the requested
+.B DT_NEEDED
+name and resolved path, or "NAME => not found" for unresolved dependencies.
+Each resolved file is printed once per input, identified by device and inode;
+each unresolved name is printed once per input.
+The ELF interpreter from
+.B PT_INTERP
+is printed as a standalone path, without a duplicate dependency mapping.
+Inputs are resolved independently. FILE: headings are printed only when
+multiple inputs are supplied.
+Inputs with neither an interpreter nor dependencies print "statically linked",
+including static PIE and dependency-free shared objects, regardless of whether
+they contain
+.BR PT_DYNAMIC .
+Missing dependencies retain libtree's nonzero exit status and stderr diagnostics.
 .IP "-p, --path"
 Show the path of libraries instead of their 
 .B soname
+This option is redundant in ldd mode.
 .IP "-v"
 Show libraries skipped by default
+Verbosity flags affect only tree output.
 .IP "-vv"
 Show dependencies of libraries skipped by default
 .IP "-vvv"
@@ -38,8 +59,22 @@ file
 Limit library traversal to a depth of at most
 .IR n .
 The value cannot be larger than 32.
+This truncates dependency traversal in both formats: depth 0 omits dependencies,
+and depth 1 includes only direct dependencies. In ldd mode, interpreter metadata
+is shown regardless of this limit.
 .IP "--"
 All arguments after '--' are interpreted as paths, not flags.
+.SH EXAMPLES
+.nf
+libtree --format tree /usr/bin/tar
+libtree --format=ldd /usr/bin/tar
+.fi
+.SH LIMITATIONS
+The ldd format provides static dependency mappings, not full loader emulation.
+It retains libtree's search precedence and architecture checks, but loader cache
+behavior, preloads, and hardware-capability selection can differ from runtime
+resolution. Load addresses and virtual dependencies such as linux-vdso are
+omitted, as are colors, tree branches, and search-path annotations.
 .SH ENVIRONMENT
 .B LD_LIBRARY_PATH
 can be used to provide additional search paths.
@@ -47,4 +82,3 @@ can be used to provide additional search paths.
 Harmen Stoppels <me@harmenstoppels.nl>
 .SH "SEE ALSO"
 .BR ldd (1)
-

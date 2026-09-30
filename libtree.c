@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <glob.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
@@ -19,6 +20,7 @@
 #define PT_NULL 0
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
+#define PT_INTERP 3
 
 #define DT_NULL 0
 #define DT_NEEDED 1
@@ -209,6 +211,7 @@ struct visited_file_array_t {
 };
 
 struct libtree_state_t {
+    enum { FORMAT_TREE, FORMAT_LDD } format;
     int verbosity;
     int path;
     int color;
@@ -217,6 +220,9 @@ struct libtree_state_t {
 
     struct string_table_t string_table;
     struct visited_file_array_t visited;
+    struct string_table_t unresolved;
+    struct visited_file_t interpreter;
+    int has_interpreter_identity;
 
     // rpath substitutions values (note: OSNAME/OSREL are FreeBSD specific, LIB
     // is glibc/Linux specific -- we substitute all so we can support
@@ -399,7 +405,18 @@ static void tree_preamble(struct libtree_state_t *s, size_t depth) {
 
 static int recurse(char *current_file, size_t depth,
                    struct libtree_state_t *state, struct compat_t compat,
-                   struct found_t reason);
+                   struct found_t reason, size_t requested);
+
+static void print_missing(size_t requested, struct libtree_state_t *s) {
+    char const *name = s->string_table.arr + requested;
+    // perf: quadratic name deduplication
+    for (size_t i = 0; i < s->unresolved.n;
+         i += strlen(s->unresolved.arr + i) + 1)
+        if (strcmp(name, s->unresolved.arr + i) == 0)
+            return;
+    string_table_store(&s->unresolved, name);
+    printf("\t%s => not found\n", name);
+}
 
 static void apply_exclude_list(size_t *needed_not_found,
                                struct small_vec_u64_t *needed_buf_offsets,
@@ -458,7 +475,8 @@ static int check_absolute_paths(size_t *needed_not_found,
             exit_code = ERR_DEPENDENCY_NOT_FOUND;
         } else {
             int code = recurse(path, depth + 1, s, compat,
-                               (struct found_t){.how = DIRECT});
+                               (struct found_t){.how = DIRECT},
+                               needed_buf_offsets->p[i]);
             if (code == ERR_DEPENDENCY_NOT_FOUND)
                 exit_code = ERR_DEPENDENCY_NOT_FOUND;
 
@@ -471,12 +489,16 @@ static int check_absolute_paths(size_t *needed_not_found,
         }
 
         if (err) {
-            tree_preamble(s, depth + 1);
-            if (s->color)
-                fputs(BOLD_RED, stdout);
-            fputs(path, stdout);
-            fputs(err, stdout);
-            fputs(s->color ? CLEAR "\n" : "\n", stdout);
+            if (s->format == FORMAT_LDD) {
+                print_missing(needed_buf_offsets->p[i], s);
+            } else {
+                tree_preamble(s, depth + 1);
+                if (s->color)
+                    fputs(BOLD_RED, stdout);
+                fputs(path, stdout);
+                fputs(err, stdout);
+                fputs(s->color ? CLEAR "\n" : "\n", stdout);
+            }
         }
 
         // Handled this library, so swap to the back.
@@ -543,7 +565,8 @@ static int check_search_paths(struct found_t reason, size_t offset,
             s->found_all_needed[depth] = *needed_not_found <= 1;
 
             // And try to locate the lib.
-            int code = recurse(path, depth + 1, s, compat, reason);
+            int code = recurse(path, depth + 1, s, compat, reason,
+                               needed_buf_offsets->p[i]);
             if (code == ERR_DEPENDENCY_NOT_FOUND)
                 exit_code = ERR_DEPENDENCY_NOT_FOUND;
             if (code == 0 || code == ERR_DEPENDENCY_NOT_FOUND) {
@@ -689,7 +712,18 @@ static void print_colon_delimited_paths(char const *start, char const *indent) {
 
 static void print_line(size_t depth, char *name, char *color_bold,
                        char *color_regular, int highlight,
-                       struct found_t reason, struct libtree_state_t *s) {
+                       struct found_t reason, struct libtree_state_t *s,
+                       char *current_file, size_t requested,
+                       struct stat *identity, int seen_before) {
+    if (s->format == FORMAT_LDD) {
+        if (depth != 0 && !seen_before &&
+            !(s->has_interpreter_identity &&
+              identity->st_dev == s->interpreter.st_dev &&
+              identity->st_ino == s->interpreter.st_ino))
+            printf("\t%s => %s\n", s->string_table.arr + requested,
+                   current_file);
+        return;
+    }
     tree_preamble(s, depth);
     // Color the filename different than the path name, if we have a path.
     char *slash = NULL;
@@ -752,6 +786,11 @@ static void print_error(size_t depth, size_t needed_not_found,
                         struct small_vec_u64_t *needed_buf_offsets,
                         char *runpath, struct libtree_state_t *s,
                         int no_def_lib) {
+    if (s->format == FORMAT_LDD) {
+        for (size_t i = 0; i < needed_not_found; ++i)
+            print_missing(needed_buf_offsets->p[i], s);
+        return;
+    }
     for (size_t i = 0; i < needed_not_found; ++i) {
         s->found_all_needed[depth] = i + 1 >= needed_not_found;
         tree_preamble(s, depth + 1);
@@ -911,8 +950,25 @@ static void visited_files_append(struct visited_file_array_t *files,
     ++files->n;
 }
 
+static void print_ldd_metadata(char *interpreter, size_t needed,
+                              struct libtree_state_t *s) {
+    if (*interpreter == '\0') {
+        if (needed == 0)
+            puts("\tstatically linked");
+        return;
+    }
+    printf("\t%s\n", interpreter);
+    struct stat identity;
+    if (stat(interpreter, &identity) == 0) {
+        s->interpreter.st_dev = identity.st_dev;
+        s->interpreter.st_ino = identity.st_ino;
+        s->has_interpreter_identity = 1;
+    }
+}
+
 static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
-                   struct compat_t compat, struct found_t reason) {
+                   struct compat_t compat, struct found_t reason,
+                   size_t requested) {
     FILE *fptr = fopen(current_file, "rb");
 
     if (fptr == NULL)
@@ -1025,6 +1081,8 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
 
     // Read the program header.
     uint64_t p_offset = MAX_OFFSET_T;
+    uint64_t interp_offset = 0, interp_size = 0;
+    char interpreter[MAX_PATH_LENGTH] = "";
     if (curr_type.class == BITS64) {
         for (uint64_t i = 0; i < header.h64.e_phnum; ++i) {
             if (fread(&prog.p64, sizeof(struct prog_64_t), 1, fptr) != 1) {
@@ -1041,6 +1099,11 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
                 small_vec_u64_append(&pt_load_filesz, prog.p64.p_filesz);
             } else if (prog.p64.p_type == PT_DYNAMIC) {
                 p_offset = prog.p64.p_offset;
+            } else if (prog.p64.p_type == PT_INTERP) {
+                interp_offset = prog.p64.p_offset;
+                interp_size = prog.p64.p_filesz;
+                if (interp_size == 0)
+                    interp_size = MAX_OFFSET_T;
             }
         }
     } else {
@@ -1059,6 +1122,11 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
                 small_vec_u64_append(&pt_load_filesz, prog.p32.p_filesz);
             } else if (prog.p32.p_type == PT_DYNAMIC) {
                 p_offset = prog.p32.p_offset;
+            } else if (prog.p32.p_type == PT_INTERP) {
+                interp_offset = prog.p32.p_offset;
+                interp_size = prog.p32.p_filesz;
+                if (interp_size == 0)
+                    interp_size = MAX_OFFSET_T;
             }
         }
     }
@@ -1073,17 +1141,47 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         return ERR_CANT_STAT;
     }
 
+    if (s->format == FORMAT_LDD && interp_size != 0) {
+        if (interp_size < 2 || interp_size > sizeof(interpreter) ||
+            interp_offset > (uint64_t)finfo.st_size ||
+            interp_size > (uint64_t)finfo.st_size - interp_offset ||
+            interp_offset > LONG_MAX ||
+            fseek(fptr, (long)interp_offset, SEEK_SET) != 0 ||
+            fread(interpreter, 1, (size_t)interp_size, fptr) != interp_size ||
+            interpreter[interp_size - 1] != '\0' ||
+            memchr(interpreter, '\0', (size_t)interp_size - 1) != NULL) {
+            fclose(fptr);
+            small_vec_u64_free(&pt_load_offset);
+            small_vec_u64_free(&pt_load_vaddr);
+            return ERR_INVALID_PROG_HEADER;
+        }
+    }
+
     struct visited_file_t *prev_visit = visited_files_find(&s->visited, &finfo);
     int seen_before = prev_visit != NULL;
     // A file previously reached only at a deeper level must be traversed
     // again, otherwise --max-depth may cut off its dependencies.
     int revisit_shallower = seen_before && depth < prev_visit->depth;
 
-    visited_files_append(&s->visited, &finfo, depth);
+    if (s->format == FORMAT_TREE)
+        visited_files_append(&s->visited, &finfo, depth);
+
+    if (seen_before && !revisit_shallower && s->format == FORMAT_LDD) {
+        fclose(fptr);
+        small_vec_u64_free(&pt_load_offset);
+        small_vec_u64_free(&pt_load_vaddr);
+        return 0;
+    }
 
     // No dynamic section?
     if (p_offset == MAX_OFFSET_T) {
-        print_line(depth, current_file, BOLD_CYAN, REGULAR_CYAN, 1, reason, s);
+        if (s->format == FORMAT_LDD) {
+            visited_files_append(&s->visited, &finfo, depth);
+            if (depth == 0)
+                print_ldd_metadata(interpreter, 0, s);
+        }
+        print_line(depth, current_file, BOLD_CYAN, REGULAR_CYAN, 1, reason, s,
+                   current_file, requested, &finfo, seen_before);
         fclose(fptr);
         small_vec_u64_free(&pt_load_offset);
         small_vec_u64_free(&pt_load_vaddr);
@@ -1182,6 +1280,21 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
         }
     }
 
+    if (s->format == FORMAT_LDD && needed.n == 0 &&
+        strtab == MAX_OFFSET_T && soname == MAX_OFFSET_T &&
+        rpath == MAX_OFFSET_T && runpath == MAX_OFFSET_T) {
+        visited_files_append(&s->visited, &finfo, depth);
+        if (depth == 0)
+            print_ldd_metadata(interpreter, 0, s);
+        print_line(depth, current_file, BOLD_CYAN, REGULAR_CYAN, 1, reason, s,
+                   current_file, requested, &finfo, seen_before);
+        fclose(fptr);
+        small_vec_u64_free(&pt_load_offset);
+        small_vec_u64_free(&pt_load_vaddr);
+        small_vec_u64_free(&needed);
+        return 0;
+    }
+
     if (strtab == MAX_OFFSET_T) {
         fclose(fptr);
         small_vec_u64_free(&pt_load_offset);
@@ -1250,13 +1363,19 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
     // No need to recurse deeper when we aren't in very verbose mode.
     int should_recurse =
         depth < s->max_depth &&
-        ((!seen_before && !in_exclude_list) ||
+        (s->format == FORMAT_LDD ||
+         (!seen_before && !in_exclude_list) ||
          (revisit_shallower && !in_exclude_list) ||
          (!seen_before && in_exclude_list && s->verbosity >= 2) ||
          s->verbosity >= 3);
 
     // Just print the library and return
     if (!should_recurse) {
+        if (s->format == FORMAT_LDD) {
+            visited_files_append(&s->visited, &finfo, depth);
+            if (depth == 0)
+                print_ldd_metadata(interpreter, needed.n, s);
+        }
         char *print_name = soname == MAX_OFFSET_T || s->path
                                ? current_file
                                : (s->string_table.arr + soname_buf_offset);
@@ -1270,7 +1389,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
 
         int highlight = !seen_before && !in_exclude_list;
         print_line(depth, print_name, bold_color, regular_color, highlight,
-                   reason, s);
+                   reason, s, current_file, requested, &finfo, seen_before);
 
         s->string_table.n = old_buf_size;
         fclose(fptr);
@@ -1347,6 +1466,12 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
 
     fclose(fptr);
 
+    if (s->format == FORMAT_LDD) {
+        visited_files_append(&s->visited, &finfo, depth);
+        if (depth == 0)
+            print_ldd_metadata(interpreter, needed.n, s);
+    }
+
     char *print_name = soname == MAX_OFFSET_T || s->path
                            ? current_file
                            : (s->string_table.arr + soname_buf_offset);
@@ -1359,7 +1484,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
 
     int highlight = !seen_before && !in_exclude_list;
     print_line(depth, print_name, bold_color, regular_color, highlight, reason,
-               s);
+               s, current_file, requested, &finfo, seen_before);
 
     // Finally start searching.
 
@@ -1368,7 +1493,7 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
     size_t needed_not_found = needed_buf_offsets.n;
 
     // Skip common libraries if not verbose
-    if (needed_not_found && s->verbosity == 0)
+    if (needed_not_found && s->verbosity == 0 && s->format == FORMAT_TREE)
         apply_exclude_list(&needed_not_found, &needed_buf_offsets, s);
 
     if (needed_not_found)
@@ -1595,6 +1720,7 @@ static void set_default_paths(struct libtree_state_t *s) {
 }
 
 static void libtree_state_init(struct libtree_state_t *s) {
+    memset(&s->unresolved, 0, sizeof(s->unresolved));
     s->string_table.n = 0;
     s->string_table.capacity = 1024;
     s->string_table.arr = malloc(s->string_table.capacity * sizeof(char));
@@ -1611,6 +1737,7 @@ static void libtree_state_init(struct libtree_state_t *s) {
 static void libtree_state_free(struct libtree_state_t *s) {
     free(s->string_table.arr);
     free(s->visited.arr);
+    free(s->unresolved.arr);
 }
 
 static int print_tree(int pathc, char **pathv, struct libtree_state_t *s) {
@@ -1624,8 +1751,15 @@ static int print_tree(int pathc, char **pathv, struct libtree_state_t *s) {
     int exit_code = 0;
 
     for (int i = 0; i < pathc; ++i) {
+        if (s->format == FORMAT_LDD) {
+            s->visited.n = 0;
+            s->unresolved.n = 0;
+            s->has_interpreter_identity = 0;
+            if (pathc > 1)
+                printf("%s:\n", pathv[i]);
+        }
         int code = recurse(pathv[i], 0, s, (struct compat_t){.any = 1},
-                           (struct found_t){.how = INPUT});
+                           (struct found_t){.how = INPUT}, SIZE_MAX);
         fflush(stdout);
         if (code != 0) {
             exit_code = code;
@@ -1722,6 +1856,7 @@ int main(int argc, char **argv) {
     s.color = getenv("NO_COLOR") == NULL && isatty(STDOUT_FILENO);
     s.verbosity = 0;
     s.path = 0;
+    s.format = FORMAT_TREE;
     s.max_depth = MAX_RECURSION_DEPTH;
 
     // We want to end up with an array of file names
@@ -1782,6 +1917,27 @@ int main(int argc, char **argv) {
                 ++s.verbosity;
             } else if (strcmp(arg, "help") == 0) {
                 opt_help = 1;
+            } else if (strcmp(arg, "format") == 0 ||
+                       strncmp(arg, "format=", 7) == 0) {
+                char *value;
+                if (arg[6] == '=') {
+                    value = arg + 7;
+                } else {
+                    if (i + 1 == argc) {
+                        fputs("Expected value after `--format`\n", stderr);
+                        return 1;
+                    }
+                    value = argv[++i];
+                }
+                if (strcmp(value, "tree") == 0)
+                    s.format = FORMAT_TREE;
+                else if (strcmp(value, "ldd") == 0)
+                    s.format = FORMAT_LDD;
+                else {
+                    fprintf(stderr, "Invalid format `%s`: expected tree or ldd\n",
+                            value);
+                    return 1;
+                }
             } else if (strcmp(arg, "ldconf") == 0) {
                 // Require a value
                 if (i + 1 == argc) {
@@ -1854,6 +2010,8 @@ int main(int argc, char **argv) {
               "  libtree -- -.so\n"
               "\n"
               "Locating libs options:\n"
+              "  --format <tree|ldd>  Output format [tree]; also --format=ldd\n"
+              "                      ldd includes common libs; ignores -p and -v\n"
               "  -p, --path       Show the path of libraries instead of the soname\n"
               "  -v               Show libraries skipped by default*\n"
               "  -vv              Show dependencies of libraries skipped by default*\n"
@@ -1862,6 +2020,7 @@ int main(int argc, char **argv) {
         fputs(s.ld_conf_file, stdout);
         fputs("]\n"
               "  --max-depth <n>  Limit library traversal to at most n levels of depth\n"
+              "                   Truncates dependencies; ldd still shows the interpreter\n"
               "\n"
               "* For brevity, the following libraries are not shown by default:\n"
               "  ",
