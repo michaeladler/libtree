@@ -372,7 +372,8 @@ static int is_in_exclude_list(char *soname) {
     // Check if we should skip this one.
     for (size_t j = 0; j < sizeof(exclude_list) / sizeof(char *); ++j) {
         size_t len = strlen(exclude_list[j]);
-        if (strncmp(start, exclude_list[j], len) != 0)
+        if ((size_t)(end - start + 1) != len ||
+            strncmp(start, exclude_list[j], len) != 0)
             continue;
         return 1;
     }
