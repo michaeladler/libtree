@@ -1420,9 +1420,11 @@ static int recurse(char *current_file, size_t depth, struct libtree_state_t *s,
     return exit_code;
 }
 
-static int parse_ld_config_file(struct string_table_t *st, char *path);
+static int parse_ld_config_file(struct string_table_t *st, char *path,
+                                size_t depth);
 
-static int ld_conf_globbing(struct string_table_t *st, char *pattern) {
+static int ld_conf_globbing(struct string_table_t *st, char *pattern,
+                            size_t depth) {
     glob_t result;
     memset(&result, 0, sizeof(result));
     int status = glob(pattern, 0, NULL, &result);
@@ -1441,13 +1443,18 @@ static int ld_conf_globbing(struct string_table_t *st, char *pattern) {
     // Otherwise parse the files we've found!
     int code = 0;
     for (size_t i = 0; i < result.gl_pathc; ++i)
-        code |= parse_ld_config_file(st, result.gl_pathv[i]);
+        code |= parse_ld_config_file(st, result.gl_pathv[i], depth);
 
     globfree(&result);
     return code;
 }
 
-static int parse_ld_config_file(struct string_table_t *st, char *path) {
+static int parse_ld_config_file(struct string_table_t *st, char *path,
+                                size_t depth) {
+    // 32-file nesting cap; use file identities for deeper trees.
+    if (depth >= MAX_RECURSION_DEPTH)
+        return 1;
+
     FILE *fptr = fopen(path, "r");
 
     if (fptr == NULL)
@@ -1516,7 +1523,7 @@ static int parse_ld_config_file(struct string_table_t *st, char *path) {
                 begin = tmp;
             }
 
-            ld_conf_globbing(st, begin);
+            ld_conf_globbing(st, begin, depth + 1);
         } else {
             // Copy over and replace trailing \0 with :.
             string_table_store(st, begin);
@@ -1534,7 +1541,7 @@ static void parse_ld_so_conf(struct libtree_state_t *s) {
     s->ld_so_conf_offset = st->n;
 
     // Linux / glibc
-    parse_ld_config_file(st, s->ld_conf_file);
+    parse_ld_config_file(st, s->ld_conf_file, 0);
 
     // Replace the last semicolon with a '\0'
     // if we have a nonzero number of paths.
